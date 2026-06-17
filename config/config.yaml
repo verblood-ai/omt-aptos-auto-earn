@@ -1,0 +1,72 @@
+# Aptos Auto Earn - Configuration
+# Copy and modify as needed
+
+# Network configuration
+# Stage 4 эталон: testnet (пакеты Liquidswap стабильнее, чем на devnet после reset).
+network: testnet
+node_url: "https://fullnode.testnet.aptoslabs.com/v1"
+
+# Faucet configuration
+faucet:
+  max_claims_per_day: 1
+  cooldown_hours: 24
+  api_url: "https://faucet.testnet.aptoslabs.com/mint"
+  amount: 100000000  # faucet amount is always in octas (100000000 octas = 1 APT)
+
+# Activity configuration
+activity:
+  enabled: true
+  min_interval_minutes: 30
+  allow_stubs: false
+  modules:
+    - "dex_swap"
+  # DEX: 1_000_000 octas = 0.01 APT; slippage 1% — запас для testnet-пула APT/USDT
+  dex_swap_amount: 1000000
+  dex_slippage: 0.01
+
+# Airdrop monitoring
+airdrop:
+  enabled: true
+  check_interval_hours: 6
+  aptos_currents_url: "https://aptosfoundation.org/currents"
+  sources:
+    - "aptos_currents"
+
+# Orchestrator schedule (long-lived `run.py`; local server time for faucet)
+scheduler:
+  faucet_daily_at: "09:00"
+  activity_interval_hours: 6
+  airdrop_interval_hours: 6
+  balance_interval_hours: 1
+
+# Logging
+logging:
+  level: "INFO"
+  file: "logs/aptos_auto_earn.log"
+  rotation: "1 day"
+  retention: "7 days"
+
+# Metrics
+metrics:
+  db_path: "data/metrics.duckdb"
+
+# Telegram notifications
+telegram:
+  enabled: false
+  bot_token: ""
+  chat_id: ""
+
+# Contract addresses for activity modules
+contracts:
+  # Liquidswap V2 (scripts_v2, router_v2) — проверено GET …/modules на 2026-04-20; см. docs/DEX.md
+  liquidswap_router: "0x190d44266241744264b964a37b8f09863167a12d3e70cda39376cfb4e3561e12"
+  liquidswap_resource_account: "0x05a97986a9d031c4567e15b797be516910cfcb4156312482efc6a19c0a30c948"
+  # Пакет тестовых монет Pontem (::coins::USDT); не путать с liquidswap_router
+  liquidswap_test_coins: "0x43417434fd869edee76cca2a4d2301e528a1551b1d719b75c350c3c97d15b8b9"
+  
+  # Aave V3 on Aptos (mainnet addresses, may not be on devnet)
+  aave_pool: "0x2c5e8a45b9a86b4c1a77c5e9a4a4b2e8a45b9a86b4c1a77c5e9a4a4b2e8a45b9a"  # placeholder
+  aave_oracle: "0x3c5e8a45b9a86b4c1a77c5e9a4a4b2e8a45b9a86b4c1a77c5e9a4a4b2e8a45b9a"  # placeholder
+  
+  # NFT marketplaces (testnet/devnet)
+  nft_marketplace: "0x4c5e8a45b9a86b4c1a77c5e9a4a4b2e8a45b9a86b4c1a77c5e9a4a4b2e8a45b9a"  # placeholder

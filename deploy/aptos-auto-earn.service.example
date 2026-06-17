@@ -1,0 +1,50 @@
+# Aptos Auto Earn — systemd unit (hardened example).
+#
+# Install:
+#   sudo install -m 644 deploy/aptos-auto-earn.service.example /etc/systemd/system/aptos-auto-earn.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl start aptos-auto-earn
+# Optional autostart:
+#   sudo systemctl enable aptos-auto-earn
+#
+# Policy:
+# - Run as dedicated non-root user/group.
+# - Store secrets only in EnvironmentFile outside git (chmod 600).
+# - Keep WorkingDirectory/ExecStart absolute and consistent.
+
+[Unit]
+Description=Aptos Auto Earn orchestrator (internal schedule)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aptos-auto-earn
+Group=aptos-auto-earn
+WorkingDirectory=/opt/aptos_auto_earn
+
+# Line-buffered logs in journald; optional but useful under systemd.
+Environment=PYTHONUNBUFFERED=1
+
+# Load APTOS_* and friends from a file on the server (chmod 600, root-owned, not in git).
+EnvironmentFile=/etc/aptos-auto-earn/aptos-auto-earn.env
+
+ExecStart=/opt/aptos_auto_earn/venv/bin/python /opt/aptos_auto_earn/run.py
+
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Allow in-flight faucet / RPC to finish on `systemctl stop` (SIGTERM).
+TimeoutStopSec=120
+
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/aptos_auto_earn/data /opt/aptos_auto_earn/logs
+
+[Install]
+WantedBy=multi-user.target

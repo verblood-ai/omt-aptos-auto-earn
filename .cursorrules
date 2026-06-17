@@ -1,0 +1,72 @@
+# aptos_auto_earn — контекст для ИИ-агентов
+
+Python 3.12+, Aptos testnet/devnet через `aptos-sdk`, оркестратор с `schedule`, метрики в DuckDB.
+
+## Назначение
+
+Бот: кран APT → ончейн-активность (в первую очередь DEX Liquidswap) → запись метрик → мониторинг аирдропов (Currents). Цель «с нуля»: первый газ только с официального крана; на testnet Aptos Labs нужен `APTOS_FAUCET_JWT` (см. `docs/OPS.md`, `.env.example`).
+
+## Карта каталогов (рабочая область — не `venv/`)
+
+```
+aptos_auto_earn/
+├── run.py                 # CLI: `python run.py` | `python run.py --once` → src.main
+├── requirements.txt
+├── config/config.yaml     # Дефолты сети, контракты, scheduler, activity
+├── src/                   # Пакет приложения (импорт: `from src.X import …`)
+├── tests/                 # unittest; `python -m unittest discover -s tests -v`
+├── docs/OPS.md            # Кран, state, CI, systemd, e2e
+├── docs/DEX.md            # Liquidswap адреса, проверка модулей, devnet reset
+├── README.md              # Пользовательский быстрый старт
+├── PLAN.md, REPORT.md     # План и отчёт о стадиях
+├── TODO.md                # Ориентир Stage 5
+├── deploy/                # systemd unit примеры
+├── data/                  # gitignore: wallet, metrics.duckdb, *_state.json
+└── logs/                  # gitignore: ротация loguru
+```
+
+В **корне** также лежат разовые скрипты `test_dex.py`, `test_dex_simple.py`, `test_pontem_faucet.py`, `check_usdt.py` — не часть CI; основная проверка — `tests/`.
+
+## Модули `src/` (кратко)
+
+| Файл | Роль |
+|------|------|
+| `config.py` | `Config.load()`: YAML + `.env`, `APTOS_NETWORK`/`APTOS_NODE_URL`, `contracts`, `activity`, `scheduler`, env `LIQUIDSWAP_*`, `DEX_*`, `APTOS_FAUCET_JWT` не здесь — читает `faucet.py` через `os.environ` |
+| `main.py` | `AptosAutoEarn`: планировщик, `run_once` = balance → faucet → activity → airdrop; фабрика `dex_swap` / lending / nft по `activity.modules` |
+| `wallet.py` | `WalletManager`: ключ из `data/wallet.json` или `APTOS_PRIVATE_KEY`, REST баланс `/balance/0x1::aptos_coin::AptosCoin`, simulate/submit BCS |
+| `faucet.py` | `FaucetManager`: `data/faucet_state.json` с `by_network`; testnet — заголовки JWT; миграция плоского state |
+| `database.py` | `MetricsDB`: DuckDB, таблицы см. `METRICS_TABLES`, `record_swap`, `insert_transaction`, … |
+| `activity_base.py` | Абстрактный `ActivityModule`: `can_run()`, `run()`, `log_run()` |
+| `activity_dex_swap.py` | Liquidswap `scripts_v2::swap`; двойная симуляция, slippage, классификация ошибок, ретраи только сеть; метрики из DepositEvent |
+| `activity_lending.py`, `activity_nft_mint.py` | Не on-chain по умолчанию; `ACTIVITY_ALLOW_STUBS` |
+| `airdrop_monitor.py` | Парсинг Aptos Currents, state в `data/airdrop_state.json` |
+| `telegram_notifier.py` | Опциональные уведомления |
+| `dex_diagnostics.py` | `python -m src.dex_diagnostics --check-modules` — REST список модулей у `contracts.liquidswap_router` |
+
+## Поток данных
+
+1. Конфиг: `Config.load("config/config.yaml", ".env")` — пути к `data/`/`logs/` резолвятся от корня репо (`PROJECT_ROOT`).
+2. Оркестратор создаёт `WalletManager`, `MetricsDB`, `FaucetManager`, модули активности из конфига.
+3. DEX не сабмитит при failed simulation; результат: `success`, `skipped`, `reason`, `error_class`, `actions`.
+
+## Тесты и CI
+
+- Команда: `python -m unittest discover -s tests -v`
+- E2E (сеть): `APTOS_E2E=1` — `tests/test_dex_e2e.py`, по умолчанию skip
+- GitHub Actions: `.github/workflows/ci.yml` — только unit-тесты
+
+## Ограничения для агентов
+
+- Не коммитить `.env`, `data/wallet.json`, ключи, JWT.
+- Не предлагать `systemctl enable` без явного запроса пользователя.
+- Минимальные диффы; не переписывать архитектуру без задачи.
+- Сеть и `contracts.liquidswap_router` должны совпадать: testnet-адрес на devnet даст linker (см. `docs/DEX.md`).
+
+## Документы по темам
+
+| Тема | Файл |
+|------|------|
+| Запуск, env, таблица переменных | `README.md`, `.env.example` |
+| Кран, JWT, `faucet_state`, systemd | `docs/OPS.md` |
+| Liquidswap адреса, диагностика | `docs/DEX.md` |
+| Стадии продукта | `PLAN.md`, `REPORT.md`, `TODO.md` |

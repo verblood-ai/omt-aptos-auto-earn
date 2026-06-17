@@ -1,0 +1,30 @@
+# Aptos Auto Earn — systemd unit (paths for this checkout: /root/projects/aptos_auto_earn).
+# Installed to systemd without `enable` — start manually when ready: systemctl start aptos-auto-earn
+#
+# On another machine: adjust WorkingDirectory, ExecStart, EnvironmentFile, User/Group.
+
+[Unit]
+Description=Aptos Auto Earn orchestrator (internal schedule)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/projects/aptos_auto_earn
+
+Environment=PYTHONUNBUFFERED=1
+
+EnvironmentFile=/root/projects/aptos_auto_earn/.env
+
+ExecStart=/root/projects/aptos_auto_earn/venv/bin/python /root/projects/aptos_auto_earn/run.py
+
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=120
+
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

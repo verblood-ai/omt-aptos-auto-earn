@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Virtual environments
+venv/
+.venv/
+
+# Local secrets / runtime state (never commit)
+.env
+data/wallet.json
+data/faucet_state.json
+data/airdrop_state.json
+data/metrics.duckdb
+data/*.duckdb
+data/*.duckdb.wal
+data/*state*.json
+logs/
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
