@@ -12,6 +12,7 @@ from aptos_sdk.type_tag import TypeTag, StructTag
 
 from .activity_base import ActivityModule
 from .config import Config
+from .retry_policy import RetryTelemetry, execute_with_retry
 
 
 def classify_swap_error(message: str) -> str:
@@ -112,6 +113,13 @@ class DexSwapModule(ActivityModule):
 
         self._network_retries = 2
         self._retry_base_delay_s = 1.0
+        self._retry_max_delay_s = 8.0
+        self._retry_jitter_ratio = 0.1
+        if hasattr(config, "retry"):
+            self._network_retries = max(0, int(config.retry.rpc.attempts) - 1)
+            self._retry_base_delay_s = float(config.retry.rpc.base_delay_seconds)
+            self._retry_max_delay_s = float(config.retry.rpc.max_delay_seconds)
+            self._retry_jitter_ratio = float(config.retry.rpc.jitter_ratio)
 
     def _build_entry_function(self, from_token: str, to_token: str, amount: int, min_out: int) -> EntryFunction:
         """Build EntryFunction for Liquidswap V2 ``scripts_v2::swap``."""
@@ -144,38 +152,37 @@ class DexSwapModule(ActivityModule):
 
     async def _simulate_network_safe(
         self, entry_func: EntryFunction
-    ) -> Tuple[bool, List[Any], str]:
+    ) -> Tuple[bool, List[Any], str, RetryTelemetry]:
         """Simulate with retries only for transport-level failures."""
-        delay = self._retry_base_delay_s
-        last_err = ""
-        for attempt in range(self._network_retries + 1):
-            try:
-                return await self.wallet.simulate_transaction(entry_func)
-            except Exception as exc:
-                last_err = str(exc)
-                if is_network_exception(exc) and attempt < self._network_retries:
-                    logger.warning(f"Simulate network error (retry {attempt + 1}): {exc}")
-                    await asyncio.sleep(delay)
-                    delay *= 2.0
-                    continue
-                return False, [], last_err or repr(exc)
-        return False, [], last_err
+        ok, value, err, telemetry = await execute_with_retry(
+            lambda: self.wallet.simulate_transaction(entry_func),
+            attempts=self._network_retries + 1,
+            base_delay_seconds=self._retry_base_delay_s,
+            max_delay_seconds=self._retry_max_delay_s,
+            jitter_ratio=self._retry_jitter_ratio,
+            is_retryable=is_network_exception,
+            sleep_func=asyncio.sleep,
+        )
+        if ok:
+            result = value if isinstance(value, tuple) else (False, [], "invalid_simulation_result")
+            return result[0], result[1], result[2], telemetry
+        if err is not None and telemetry.retries > 0:
+            logger.warning("Simulation failed after {} retry(s): {}", telemetry.retries, err)
+        return False, [], str(err) if err else "simulation_failed", telemetry
 
-    async def _submit_network_safe(self, entry_func: EntryFunction) -> str:
-        delay = self._retry_base_delay_s
-        last: Optional[Exception] = None
-        for attempt in range(self._network_retries + 1):
-            try:
-                return await self.wallet.submit_transaction(entry_func)
-            except Exception as exc:
-                last = exc
-                if is_network_exception(exc) and attempt < self._network_retries:
-                    logger.warning(f"Submit network error (retry {attempt + 1}): {exc}")
-                    await asyncio.sleep(delay)
-                    delay *= 2.0
-                    continue
-                raise
-        raise last if last else RuntimeError("submit_transaction failed")
+    async def _submit_network_safe(self, entry_func: EntryFunction) -> Tuple[str, RetryTelemetry]:
+        ok, value, err, telemetry = await execute_with_retry(
+            lambda: self.wallet.submit_transaction(entry_func),
+            attempts=self._network_retries + 1,
+            base_delay_seconds=self._retry_base_delay_s,
+            max_delay_seconds=self._retry_max_delay_s,
+            jitter_ratio=self._retry_jitter_ratio,
+            is_retryable=is_network_exception,
+            sleep_func=asyncio.sleep,
+        )
+        if ok:
+            return str(value), telemetry
+        raise err if err else RuntimeError("submit_transaction failed")
 
     @staticmethod
     def _token_symbol(token_type: str) -> str:
@@ -193,7 +200,18 @@ class DexSwapModule(ActivityModule):
         extra: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         duration = time.time() - start_time
-        self.log_run(duration, actions, False, error)
+        extra = extra or {}
+        self.log_run(
+            duration,
+            actions,
+            False,
+            error,
+            skipped=skipped,
+            skip_reason=reason if skipped else None,
+            error_class=error_class,
+            retry_count=int(extra.get("retry_count", 0) or 0),
+            metadata={"retry_delay_seconds": extra.get("retry_delay_seconds", 0.0)},
+        )
         out: Dict[str, Any] = {
             "module": self.module_name,
             "success": False,
@@ -204,8 +222,7 @@ class DexSwapModule(ActivityModule):
             "actions": actions,
             "duration": duration,
         }
-        if extra:
-            out.update(extra)
+        out.update(extra)
         return out
 
     async def run(self) -> Dict[str, Any]:
@@ -213,6 +230,8 @@ class DexSwapModule(ActivityModule):
         start_time = time.time()
         actions = 0
         tx_hash: Optional[str] = None
+        retry_count_total = 0
+        retry_delay_total = 0.0
 
         try:
             balance = await self.wallet.get_balance()
@@ -221,7 +240,14 @@ class DexSwapModule(ActivityModule):
             if balance_octas < self.swap_amount:
                 logger.info(f"Insufficient balance: {balance_octas} < {self.swap_amount}")
                 duration = time.time() - start_time
-                self.log_run(duration, actions, True)
+                self.log_run(
+                    duration,
+                    actions,
+                    True,
+                    skipped=True,
+                    skip_reason="insufficient_balance",
+                    error_class="insufficient_balance",
+                )
                 return {
                     "module": self.module_name,
                     "success": True,
@@ -242,7 +268,9 @@ class DexSwapModule(ActivityModule):
                 1,
             )
             logger.info("Simulating swap (probe, min_out=1)…")
-            ok_probe, probe_results, probe_err = await self._simulate_network_safe(probe_entry)
+            ok_probe, probe_results, probe_err, probe_retry = await self._simulate_network_safe(probe_entry)
+            retry_count_total += int(probe_retry.retries)
+            retry_delay_total += float(probe_retry.total_delay_seconds)
             if not ok_probe:
                 err_text = probe_err or ""
                 if probe_results:
@@ -259,7 +287,11 @@ class DexSwapModule(ActivityModule):
                     error_class=ec,
                     skipped=True,
                     reason="simulation_failed",
-                    extra={"simulation_phase": "probe"},
+                    extra={
+                        "simulation_phase": "probe",
+                        "retry_count": retry_count_total,
+                        "retry_delay_seconds": retry_delay_total,
+                    },
                 )
 
             probe_tx0: Dict[str, Any] = probe_results[0] if probe_results and isinstance(probe_results[0], dict) else {}
@@ -282,7 +314,9 @@ class DexSwapModule(ActivityModule):
             )
 
             logger.info("Simulating swap (final min_out)…")
-            ok_final, final_results, final_err = await self._simulate_network_safe(entry_func)
+            ok_final, final_results, final_err, final_retry = await self._simulate_network_safe(entry_func)
+            retry_count_total += int(final_retry.retries)
+            retry_delay_total += float(final_retry.total_delay_seconds)
             if not ok_final:
                 err_text = final_err or ""
                 if final_results:
@@ -303,6 +337,8 @@ class DexSwapModule(ActivityModule):
                         "simulation_phase": "final",
                         "quoted_amount_out": quoted_out,
                         "min_amount_out": min_amount_out,
+                        "retry_count": retry_count_total,
+                        "retry_delay_seconds": retry_delay_total,
                     },
                 )
 
@@ -312,7 +348,9 @@ class DexSwapModule(ActivityModule):
                 sim_amount_out = quoted_out
 
             logger.info("Submitting swap transaction…")
-            tx_hash = await self._submit_network_safe(entry_func)
+            tx_hash, submit_retry = await self._submit_network_safe(entry_func)
+            retry_count_total += int(submit_retry.retries)
+            retry_delay_total += float(submit_retry.total_delay_seconds)
             logger.info(f"Swap transaction submitted: {tx_hash}")
 
             confirmed = await self.wallet.wait_for_transaction(tx_hash, timeout_seconds=60)
@@ -324,7 +362,17 @@ class DexSwapModule(ActivityModule):
             else:
                 logger.warning(f"Swap tx submitted but confirmation timed out: {tx_hash}")
                 duration = time.time() - start_time
-                self.log_run(duration, 0, False, "confirmation_timeout")
+                self.log_run(
+                    duration,
+                    0,
+                    False,
+                    "confirmation_timeout",
+                    skipped=True,
+                    skip_reason="confirmation_timeout",
+                    error_class="rpc",
+                    retry_count=retry_count_total,
+                    metadata={"retry_delay_seconds": retry_delay_total},
+                )
                 self.db.insert_transaction(
                     tx_hash=tx_hash,
                     network=self.config.network,
@@ -337,6 +385,8 @@ class DexSwapModule(ActivityModule):
                         "to_token": self.swap_to_token,
                         "error_class": "rpc",
                         "note": "Submitted; confirmation wait timed out",
+                        "retry_count": retry_count_total,
+                        "retry_delay_seconds": retry_delay_total,
                     },
                 )
                 return {
@@ -348,6 +398,8 @@ class DexSwapModule(ActivityModule):
                     "error_class": "rpc",
                     "actions": 0,
                     "tx_hash": tx_hash,
+                    "retry_count": retry_count_total,
+                    "retry_delay_seconds": retry_delay_total,
                     "duration": duration,
                 }
 
@@ -355,7 +407,13 @@ class DexSwapModule(ActivityModule):
 
             actions = 1
             duration = time.time() - start_time
-            self.log_run(duration, actions, True)
+            self.log_run(
+                duration,
+                actions,
+                True,
+                retry_count=retry_count_total,
+                metadata={"retry_delay_seconds": retry_delay_total},
+            )
 
             self.db.insert_transaction(
                 tx_hash=tx_hash,
@@ -372,6 +430,8 @@ class DexSwapModule(ActivityModule):
                     "simulated_amount_out": sim_amount_out,
                     "committed_amount_out": committed_out,
                     "min_amount_out": min_amount_out,
+                    "retry_count": retry_count_total,
+                    "retry_delay_seconds": retry_delay_total,
                 },
             )
 
@@ -394,6 +454,8 @@ class DexSwapModule(ActivityModule):
                 "amount_in": self.swap_amount,
                 "quoted_amount_out": quoted_out,
                 "amount_out_actual": committed_out if committed_out is not None else sim_amount_out,
+                "retry_count": retry_count_total,
+                "retry_delay_seconds": retry_delay_total,
                 "duration": duration,
             }
 
@@ -416,6 +478,8 @@ class DexSwapModule(ActivityModule):
                         "to_token": self.swap_to_token,
                         "error": err_text,
                         "error_class": ec,
+                        "retry_count": retry_count_total,
+                        "retry_delay_seconds": retry_delay_total,
                     },
                 )
             return self._failure_result(
@@ -423,5 +487,12 @@ class DexSwapModule(ActivityModule):
                 actions=actions,
                 error=err_text,
                 error_class=ec,
-                extra={"tx_hash": tx_hash} if tx_hash else {},
+                extra={
+                    "tx_hash": tx_hash,
+                    "retry_count": retry_count_total,
+                    "retry_delay_seconds": retry_delay_total,
+                } if tx_hash else {
+                    "retry_count": retry_count_total,
+                    "retry_delay_seconds": retry_delay_total,
+                },
             )

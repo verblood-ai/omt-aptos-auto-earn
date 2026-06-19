@@ -13,8 +13,17 @@ from loguru import logger
 
 from .database import MetricsDB
 from .config import Config, PROJECT_ROOT
+from .retry_policy import execute_with_retry
 
 RETRYABLE_HTTP_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
+
+
+class RetryableScrapeError(RuntimeError):
+    """Raised for retryable scrape HTTP status."""
+
+
+class NonRetryableScrapeError(RuntimeError):
+    """Raised for non-retryable scrape HTTP status."""
 
 
 def _parse_aptos_currents_html_with_stats(
@@ -272,40 +281,38 @@ class AirdropMonitor:
         return [], {"parse_errors": 0, "http_retries": 0}
 
     async def _fetch_with_retry(self, client: httpx.AsyncClient, url: str) -> tuple[Optional[str], int]:
-        retries = 0
-        for attempt in range(1, self.http_max_retries + 1):
-            try:
-                response = await client.get(url)
-                if response.status_code in RETRYABLE_HTTP_STATUS_CODES:
-                    raise httpx.HTTPStatusError(
-                        f"Retryable HTTP status: {response.status_code}",
-                        request=response.request,
-                        response=response,
-                    )
-                response.raise_for_status()
-                return response.text, retries
-            except httpx.HTTPStatusError as exc:
-                status = exc.response.status_code if exc.response is not None else 0
-                is_retryable = status in RETRYABLE_HTTP_STATUS_CODES
-                if attempt == self.http_max_retries or not is_retryable:
-                    logger.error("Currents fetch failed with HTTP {} (attempt {}/{})", status, attempt, self.http_max_retries)
-                    return None, retries
-            except httpx.HTTPError as exc:
-                if attempt == self.http_max_retries:
-                    logger.error("Currents fetch failed after {} attempts: {}", self.http_max_retries, exc)
-                    return None, retries
+        retry_conf = getattr(getattr(self.config, "retry", None), "scraping", None)
+        retry_attempts = int(getattr(retry_conf, "attempts", 3))
+        retry_base = float(getattr(retry_conf, "base_delay_seconds", 1.0))
+        retry_max = float(getattr(retry_conf, "max_delay_seconds", 16.0))
+        retry_jitter = float(getattr(retry_conf, "jitter_ratio", 0.1))
 
-            retries += 1
-            delay = self.http_backoff_base_seconds * (2 ** (attempt - 1))
-            logger.warning(
-                "Currents fetch retry in {:.1f}s (attempt {}/{})",
-                delay,
-                attempt + 1,
-                self.http_max_retries,
-            )
-            await asyncio.sleep(delay)
+        async def _fetch_once() -> httpx.Response:
+            response = await client.get(url)
+            if response.status_code in RETRYABLE_HTTP_STATUS_CODES:
+                raise RetryableScrapeError(f"HTTP {response.status_code}")
+            if response.status_code >= 400:
+                raise NonRetryableScrapeError(f"HTTP {response.status_code}")
+            return response
 
-        return None, retries
+        ok, response_obj, err, telemetry = await execute_with_retry(
+            _fetch_once,
+            attempts=retry_attempts,
+            base_delay_seconds=retry_base,
+            max_delay_seconds=retry_max,
+            jitter_ratio=retry_jitter,
+            is_retryable=lambda exc: isinstance(exc, (RetryableScrapeError, httpx.HTTPError)),
+            sleep_func=asyncio.sleep,
+        )
+        if ok:
+            return response_obj.text, telemetry.retries
+        logger.error(
+            "Currents fetch failed after attempts={} retries={} err={}",
+            telemetry.attempts,
+            telemetry.retries,
+            err,
+        )
+        return None, telemetry.retries
 
     async def _check_aptos_currents(self) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
         """Parse Aptos Foundation Currents listing for ecosystem-relevant links."""

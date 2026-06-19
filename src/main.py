@@ -11,19 +11,24 @@ Automated earnings on Aptos testnet:
 import asyncio
 import signal
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 import schedule
 from loguru import logger
 
-from .config import Config
+from .config import Config, PROJECT_ROOT
 from .database import MetricsDB
 from .wallet import WalletManager
 from .faucet import FaucetManager
 from .airdrop_monitor import AirdropMonitor
 from .telegram_notifier import TelegramNotifier
 from .dex_diagnostics import check_liquidswap_modules
+from .kpi_alerts import KPIAlertState, KPIEvaluator
+from .policy_engine import PolicyEngine
+from .readiness_gate import ReadinessGate
+from .strategy_engine import StrategyDecision, StrategyEngine
 
 # Import activity modules
 from .activity_dex_swap import DexSwapModule
@@ -72,6 +77,16 @@ class AptosAutoEarn:
             )
             logger.info("Telegram notifications enabled")
 
+        # Runtime safety / strategy / KPI evaluators
+        self.readiness_gate = ReadinessGate(self.config)
+        self.policy_engine = PolicyEngine(self.config, self.db)
+        self.strategy_engine = StrategyEngine(self.config, self.policy_engine)
+        self.kpi_evaluator = KPIEvaluator(self.config, self.db)
+        self.kpi_alert_state = KPIAlertState(
+            PROJECT_ROOT / "data" / "kpi_alert_state.json",
+            cooldown_minutes=self.config.kpi_alerts.cooldown_minutes,
+        )
+
         # Schedule state
         self.running = True
         self._scheduled_job_queue: asyncio.Queue[str] = asyncio.Queue()
@@ -81,6 +96,12 @@ class AptosAutoEarn:
         self._dex_preflight_checked = False
         self._dex_preflight_ok = True
         self._dex_preflight_error = ""
+        self._last_readiness_state: dict[str, tuple[bool, str]] = {}
+        self._last_gate_log_at: dict[str, datetime] = {}
+        self._last_gate_reason: dict[str, str] = {}
+        self._last_advisory_sent_at: dict[str, datetime] = {}
+        self._last_advisory_reason: dict[str, str] = {}
+        self._last_kpi_eval_at: datetime | None = None
         self._setup_signal_handlers()
 
     def _setup_logging(self):
@@ -169,6 +190,123 @@ class AptosAutoEarn:
         )
         return False
 
+    def _log_gate_reason_once(self, module_name: str, reason: str) -> None:
+        dedup_window = max(0, int(self.config.readiness.dedup_log_window_seconds))
+        now = datetime.now(timezone.utc)
+        last_reason = self._last_gate_reason.get(module_name)
+        last_at = self._last_gate_log_at.get(module_name)
+        if last_reason == reason and last_at is not None and dedup_window > 0:
+            if (now - last_at).total_seconds() < dedup_window:
+                return
+        logger.warning("Module {} blocked by readiness gate: {}", module_name, reason)
+        self._last_gate_reason[module_name] = reason
+        self._last_gate_log_at[module_name] = now
+
+    def _record_readiness_transition(self, module_name: str, ready: bool, reason: str, signals: dict) -> None:
+        prev = self._last_readiness_state.get(module_name)
+        if prev == (ready, reason):
+            return
+        self._last_readiness_state[module_name] = (ready, reason)
+        self.db.insert_readiness_event(
+            module_name=module_name,
+            status="ready" if ready else "blocked",
+            reason=reason,
+            source="orchestrator_gate",
+            metadata={"signals": signals},
+        )
+
+    def _record_activity_skip(
+        self,
+        *,
+        module_name: str,
+        reason: str,
+        gate_reason: str = "",
+        error_class: str = "skip",
+        metadata: dict | None = None,
+    ) -> None:
+        self.db.insert_activity_run(
+            module_name=module_name,
+            duration_seconds=0.0,
+            actions_performed=0,
+            success=True,
+            error_message=None,
+            skipped=True,
+            skip_reason=reason,
+            error_class=error_class,
+            gate_reason=gate_reason or reason,
+            retry_count=0,
+            metadata=metadata or {},
+        )
+
+    async def _maybe_send_advisory_notice(
+        self,
+        *,
+        module_name: str,
+        decision: StrategyDecision,
+        correlation_id: str,
+    ) -> None:
+        if not decision.advisory_notice:
+            return
+        if not self.telegram:
+            return
+
+        key = f"{module_name}:{decision.severity}"
+        now = datetime.now(timezone.utc)
+        cooldown_minutes = max(1, int(self.config.strategy.advisory_cooldown_minutes))
+        last_at = self._last_advisory_sent_at.get(key)
+        last_reason = self._last_advisory_reason.get(key)
+        if last_reason == decision.reason and last_at is not None:
+            if (now - last_at).total_seconds() < cooldown_minutes * 60:
+                return
+
+        self._last_advisory_sent_at[key] = now
+        self._last_advisory_reason[key] = decision.reason
+        await self.telegram.send_notification(
+            "Strategy Advisory",
+            (
+                f"module={module_name}\n"
+                f"mode={decision.effective_mode}\n"
+                f"action={decision.action}\n"
+                f"reason={decision.reason}\n"
+                f"correlation_id={correlation_id}"
+            ),
+            success=False,
+        )
+
+    async def _evaluate_and_alert_kpis(self, trigger: str) -> None:
+        if not self.config.kpi_alerts.enabled:
+            return
+        interval = max(1, int(self.config.kpi_alerts.evaluation_interval_minutes))
+        now = datetime.now(timezone.utc)
+        if self._last_kpi_eval_at is not None:
+            elapsed = (now - self._last_kpi_eval_at).total_seconds()
+            if elapsed < interval * 60:
+                return
+        self._last_kpi_eval_at = now
+
+        runtime_signals = {
+            "last_faucet_success_ts": self.db.get_last_faucet_success_ts(),
+            "last_airdrop_check_ts": self.airdrop_monitor.state.get("last_check"),
+        }
+        snapshot = self.kpi_evaluator.evaluate(runtime_signals=runtime_signals)
+        logger.info("KPI snapshot trigger={} severity={} metrics={}", trigger, snapshot.get("severity"), snapshot.get("metrics"))
+        events = self.kpi_alert_state.build_events(snapshot)
+        for event in events:
+            metric = event["metric"]
+            if event["type"] == "alert":
+                text = (
+                    f"KPI={metric['key']} severity={metric['severity']} value={metric['value']:.4f} "
+                    f"warn={metric['warn_threshold']:.4f} critical={metric['critical_threshold']:.4f}"
+                )
+                logger.warning("KPI alert: {}", text)
+                if self.telegram:
+                    await self.telegram.send_notification("KPI Alert", text, success=False)
+            elif event["type"] == "recovery":
+                text = f"KPI={metric['key']} recovered to OK (value={metric['value']:.4f})"
+                logger.info("KPI recovery: {}", text)
+                if self.telegram:
+                    await self.telegram.send_notification("KPI Recovery", text, success=True)
+
     async def run_activity_cycle(self):
         """Execute one activity cycle."""
         now = datetime.now(timezone.utc)
@@ -188,7 +326,14 @@ class AptosAutoEarn:
         logger.info("Starting activity cycle...")
 
         # Check balance first
-        balance = await self.wallet.get_balance()
+        rpc_ok = True
+        rpc_error = ""
+        try:
+            balance = await self.wallet.get_balance()
+        except Exception as exc:  # noqa: BLE001
+            balance = 0.0
+            rpc_ok = False
+            rpc_error = str(exc)
         logger.info(f"Current APT balance: {balance}")
 
         has_dex_module = any(module.module_name == "dex_swap" for module in self.activity_modules)
@@ -197,35 +342,171 @@ class AptosAutoEarn:
             dex_preflight_ok = await self._ensure_dex_preflight()
 
         for module in self.activity_modules:
-            if module.module_name == "dex_swap" and not dex_preflight_ok:
-                logger.warning(f"Module dex_swap skipped: {self._dex_preflight_error}")
-                continue
             can_run, reason = module.can_run()
-            if can_run:
-                logger.info(f"Running module: {module.module_name}")
-                result = await module.run()
-                if result["success"]:
-                    if result.get("skipped"):
-                        logger.info(
-                            f"Module {module.module_name} skipped: {result.get('reason')} "
-                            f"({result.get('duration', 0):.2f}s)"
-                        )
-                    else:
-                        actions = result.get("actions", 0)
-                        duration = result.get("duration", 0.0)
-                        logger.info(
-                            f"Module {module.module_name} completed: {actions} actions in {duration:.2f}s"
-                        )
-                elif result.get("skipped"):
+            if not can_run:
+                self._record_activity_skip(
+                    module_name=module.module_name,
+                    reason="module_can_run_false",
+                    gate_reason=reason,
+                    error_class="module_precheck_failed",
+                    metadata={"source": "module.can_run"},
+                )
+                logger.debug(f"Module {module.module_name} skipped: {reason}")
+                continue
+
+            faucet_can_claim, faucet_reason = self.faucet.can_claim()
+            readiness = self.readiness_gate.evaluate(
+                module_name=module.module_name,
+                balance_apt=balance,
+                rpc_ok=rpc_ok,
+                rpc_error=rpc_error,
+                dex_preflight_ok=dex_preflight_ok,
+                dex_preflight_error=self._dex_preflight_error,
+                faucet_can_claim=faucet_can_claim,
+                faucet_reason=faucet_reason,
+            )
+            self._record_readiness_transition(
+                module_name=module.module_name,
+                ready=readiness.ready,
+                reason=readiness.reason,
+                signals=readiness.signal_snapshot,
+            )
+            if not readiness.ready:
+                self._log_gate_reason_once(module.module_name, readiness.reason)
+                self._record_activity_skip(
+                    module_name=module.module_name,
+                    reason="readiness_blocked",
+                    gate_reason=readiness.reason,
+                    error_class="readiness_blocked",
+                    metadata={"signals": readiness.signal_snapshot},
+                )
+                continue
+
+            correlation_id = uuid.uuid4().hex
+            decision = self.strategy_engine.evaluate(
+                {
+                    "module_name": module.module_name,
+                    "balance_apt": balance,
+                    "readiness_reason": readiness.reason,
+                }
+            )
+            if self.config.strategy.enabled:
+                self.db.insert_strategy_decision(
+                    correlation_id=correlation_id,
+                    module_name=module.module_name,
+                    mode=decision.mode,
+                    effective_mode=decision.effective_mode,
+                    action=decision.action,
+                    severity=decision.severity,
+                    reason=decision.reason,
+                    stage="pre",
+                    outcome="pending",
+                    rule_hits=decision.rule_hits,
+                    inputs={
+                        "balance_apt": balance,
+                        "readiness_reason": readiness.reason,
+                    },
+                    metadata=decision.policy_snapshot,
+                )
+
+            await self._maybe_send_advisory_notice(
+                module_name=module.module_name,
+                decision=decision,
+                correlation_id=correlation_id,
+            )
+            if decision.action in {"block", "defer"}:
+                self._record_activity_skip(
+                    module_name=module.module_name,
+                    reason="policy_denied",
+                    gate_reason=decision.reason,
+                    error_class="policy_denied",
+                    metadata={
+                        "mode": decision.mode,
+                        "effective_mode": decision.effective_mode,
+                        "rule_hits": decision.rule_hits,
+                        "correlation_id": correlation_id,
+                    },
+                )
+                if self.config.strategy.enabled:
+                    self.db.insert_strategy_decision(
+                        correlation_id=correlation_id,
+                        module_name=module.module_name,
+                        mode=decision.mode,
+                        effective_mode=decision.effective_mode,
+                        action=decision.action,
+                        severity=decision.severity,
+                        reason=decision.reason,
+                        stage="post",
+                        outcome="blocked",
+                        rule_hits=decision.rule_hits,
+                        inputs={"balance_apt": balance},
+                        metadata={
+                            "remediation_hint": decision.remediation_hint,
+                            "policy_snapshot": decision.policy_snapshot,
+                        },
+                    )
+                continue
+
+            logger.info(f"Running module: {module.module_name}")
+            result = await module.run()
+            if decision.action == "warn" and not result.get("skipped"):
+                result["executed_despite_advisory"] = True
+            if result["success"]:
+                if result.get("skipped"):
                     logger.info(
-                        f"Module {module.module_name} skipped (no on-chain action): "
-                        f"{result.get('reason')} class={result.get('error_class')} "
-                        f"— {result.get('error', '')} ({result.get('duration', 0):.2f}s)"
+                        f"Module {module.module_name} skipped: {result.get('reason')} "
+                        f"({result.get('duration', 0):.2f}s)"
                     )
                 else:
-                    logger.warning(f"Module {module.module_name} failed: {result.get('error')}")
+                    actions = result.get("actions", 0)
+                    duration = result.get("duration", 0.0)
+                    logger.info(
+                        f"Module {module.module_name} completed: {actions} actions in {duration:.2f}s"
+                    )
+            elif result.get("skipped"):
+                logger.info(
+                    f"Module {module.module_name} skipped (no on-chain action): "
+                    f"{result.get('reason')} class={result.get('error_class')} "
+                    f"— {result.get('error', '')} ({result.get('duration', 0):.2f}s)"
+                )
             else:
-                logger.debug(f"Module {module.module_name} skipped: {reason}")
+                logger.warning(f"Module {module.module_name} failed: {result.get('error')}")
+
+            if self.config.strategy.enabled:
+                if result.get("skipped"):
+                    outcome = "skipped"
+                elif result.get("success"):
+                    outcome = "executed"
+                else:
+                    outcome = "failed"
+                self.db.insert_strategy_decision(
+                    correlation_id=correlation_id,
+                    module_name=module.module_name,
+                    mode=decision.mode,
+                    effective_mode=decision.effective_mode,
+                    action=decision.action,
+                    severity=decision.severity,
+                    reason=decision.reason,
+                    stage="post",
+                    outcome=outcome,
+                    rule_hits=decision.rule_hits,
+                    inputs={
+                        "balance_apt": balance,
+                        "readiness_reason": readiness.reason,
+                    },
+                    metadata={
+                        "result": {
+                            "success": bool(result.get("success")),
+                            "skipped": bool(result.get("skipped")),
+                            "reason": result.get("reason", ""),
+                            "error": result.get("error", ""),
+                            "executed_despite_advisory": bool(result.get("executed_despite_advisory", False)),
+                        },
+                        "correlation_id": correlation_id,
+                    },
+                )
+
+        await self._evaluate_and_alert_kpis(trigger="activity_cycle")
 
     async def run_airdrop_cycle(self):
         """Execute airdrop monitoring cycle."""
@@ -333,6 +614,7 @@ class AptosAutoEarn:
         await self.run_faucet_cycle()
         await self.run_activity_cycle()
         await self.run_airdrop_cycle()
+        await self._evaluate_and_alert_kpis(trigger="run_once")
 
         logger.info("Single cycle completed")
 

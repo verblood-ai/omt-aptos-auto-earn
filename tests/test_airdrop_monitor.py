@@ -46,6 +46,10 @@ class TestAirdropMonitor(unittest.IsolatedAsyncioTestCase):
         cfg.airdrop.sources = ["aptos_currents"]
         cfg.airdrop.check_interval_hours = 6
         cfg.airdrop.aptos_currents_url = "https://aptosfoundation.org/currents"
+        cfg.retry.scraping.attempts = 3
+        cfg.retry.scraping.base_delay_seconds = 0.0
+        cfg.retry.scraping.max_delay_seconds = 0.0
+        cfg.retry.scraping.jitter_ratio = 0.0
         with patch("src.airdrop_monitor.PROJECT_ROOT", root):
             return AirdropMonitor(cfg, MagicMock())
 

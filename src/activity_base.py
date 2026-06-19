@@ -1,8 +1,7 @@
 """Base class for activity modules."""
 
-import time
 from abc import ABC, abstractmethod
-from typing import Dict, Any, List
+from typing import Dict, Any, Optional
 
 from loguru import logger
 from .database import MetricsDB
@@ -28,12 +27,31 @@ class ActivityModule(ABC):
         """Execute the activity. Returns result dict."""
         pass
 
-    def log_run(self, duration: float, actions: int, success: bool, error: str = None):
+    def log_run(
+        self,
+        duration: float,
+        actions: int,
+        success: bool,
+        error: Optional[str] = None,
+        *,
+        skipped: bool = False,
+        skip_reason: Optional[str] = None,
+        error_class: Optional[str] = None,
+        gate_reason: Optional[str] = None,
+        retry_count: int = 0,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Log activity run to database."""
         self.db.insert_activity_run(
             module_name=self.module_name,
             duration_seconds=duration,
             actions_performed=actions,
             success=success,
-            error_message=error
+            error_message=error,
+            skipped=skipped,
+            skip_reason=skip_reason,
+            error_class=error_class,
+            gate_reason=gate_reason,
+            retry_count=retry_count,
+            metadata=metadata,
         )

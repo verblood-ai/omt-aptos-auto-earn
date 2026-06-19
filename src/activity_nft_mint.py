@@ -39,7 +39,14 @@ class NFTMintModule(ActivityModule):
             await self._simulate_mint()
 
             duration = time.time() - start_time
-            self.log_run(duration, actions, True)
+            self.log_run(
+                duration,
+                actions,
+                True,
+                skipped=True,
+                skip_reason="stub_simulation",
+                error_class="stub",
+            )
             return {
                 "module": self.module_name,
                 "success": True,

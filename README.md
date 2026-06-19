@@ -36,6 +36,8 @@
 
 Так удобнее держать бота на сервере: автозапуск после перезагрузки, перезапуск при падении, логи в `journalctl`. В репозитории два варианта: готовый unit под текущий путь [`deploy/aptos-auto-earn.service`](deploy/aptos-auto-earn.service) и шаблон с плейсхолдерами [`deploy/aptos-auto-earn.service.example`](deploy/aptos-auto-earn.service.example).
 
+Текущий практический статус: `aptos-auto-earn` уже запущен через `systemd` как основной режим работы; ниже оставлены шаги для воспроизведения на новой машине.
+
 1. На сервере подготовьте каталог проекта, **`venv`** с зависимостями и файл **`.env`** (права `600`, не в git). В unit-файле должны совпадать **рабочий каталог** (`WorkingDirectory`) и пути к `venv/bin/python` и `run.py`.
 2. Установите unit в systemd (имя сервиса `aptos-auto-earn`; **`enable` здесь не выполняется** — только установка файла и `daemon-reload`):
    - `sudo install -m 644 deploy/aptos-auto-earn.service /etc/systemd/system/aptos-auto-earn.service`
@@ -189,7 +191,7 @@ MIT
 
 ---
 
-**Статус (актуально на 2026-04-20):**
+**Статус (актуально на 2026-06-20):**
 
 | Этап | Описание | Статус |
 |------|----------|--------|
@@ -197,8 +199,8 @@ MIT
 | 2 | Wallet & Faucet Testing | ✅ COMPLETE |
 | 3 | Metrics & Monitoring | ✅ COMPLETE (ops: [docs/OPS.md](./docs/OPS.md)) |
 | 4 | Activity Implementation (Liquidswap DEX) | ✅ COMPLETE (см. `docs/DEX.md`, диагностика модулей, тесты с моками) |
-| 5 | Airdrop Monitoring | 🟡 IN PROGRESS (публичный источник `aptos_currents`; Galxe/Zealy/DappRadar — только при наличии API keys); чеклист следующей стадии — **`TODO.md`** |
-| 6 | Production Deployment (systemd, notifications) | ⏭️ PENDING |
+| 5 | Airdrop Monitoring | 🟡 IN PROGRESS (базовый `aptos_currents` работает; фокус — устойчивый ingestion и качество сигнала); чеклист — **`TODO.md`** |
+| 6 | Production Deployment (systemd, notifications) | 🟡 IN PROGRESS (`systemd`-режим запущен; остаются hardening и операционные проверки) |
 
 **Что уже есть в коде (коротко):**
 - ✅ Конфиг: `src/config.py` + `config/config.yaml` + `.env.example` (в т.ч. `APTOS_NODE_URL`, `FAUCET_API_URL`, `ACTIVITY_MODULES`, `ACTIVITY_ALLOW_STUBS`)
@@ -206,9 +208,12 @@ MIT
 - ✅ Метрики: `src/database.py` (включая `dex_swaps`)
 - ✅ Оркестратор: `src/main.py` + `run.py`
 - ✅ Минимальные тесты + CI: `tests/`, `.github/workflows/ci.yml`, `.gitignore`
+- ✅ Systemd-база: unit-файлы в `deploy/` и рабочий запуск сервиса `aptos-auto-earn` в Linux-окружении
 
 **Отчёт о состоянии проекта:** [REPORT.md](./REPORT.md)
 
 **Следующие шаги (приоритет):**
-1. Stage 5: устойчивый ingestion для `aptos_currents` + (опционально) интеграции Galxe/Zealy/DappRadar по ключам (см. `TODO.md`)
-2. Stage 6: systemd unit в прод-среде + политика секретов (шаблон: [deploy/aptos-auto-earn.service.example](deploy/aptos-auto-earn.service.example))
+1. Stage 5: устойчивый ingestion для `aptos_currents` (дедупликация, retries/backoff, прозрачные причины пропусков) + опциональные интеграции по API ключам (см. `TODO.md`)
+2. Операционный контур faucet: контроль валидности `APTOS_FAUCET_JWT` для testnet и явные алерты/метрики по `missing_or_expired_jwt`
+3. Balance-aware исполнение активности: предчек минимального APT и адаптация/skip DEX без «шумных» ошибок при нехватке газа
+4. Stage 6 hardening: финализация runbook и регулярный smoke-проверочный сценарий после рестарта сервиса

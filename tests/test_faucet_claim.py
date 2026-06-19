@@ -45,6 +45,10 @@ class TestFaucetClaim(unittest.IsolatedAsyncioTestCase):
         cfg.faucet.cooldown_hours = 0
         cfg.faucet.api_url = "https://faucet.devnet.aptoslabs.com/mint"
         cfg.faucet.amount = 100_000_000
+        cfg.retry.faucet_http.attempts = 2
+        cfg.retry.faucet_http.base_delay_seconds = 0.0
+        cfg.retry.faucet_http.max_delay_seconds = 0.0
+        cfg.retry.faucet_http.jitter_ratio = 0.0
 
         db = MagicMock()
         wallet = MagicMock()

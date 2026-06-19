@@ -14,9 +14,15 @@ from aptos_sdk.type_tag import TypeTag, StructTag
 
 from .database import MetricsDB
 from .config import Config, PROJECT_ROOT
+from .retry_policy import execute_with_retry
 
 # Flat `faucet_state.json` (pre–per-network) historically matched devnet-heavy setups.
 _LEGACY_FLAT_NETWORK = "devnet"
+RETRYABLE_HTTP_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
+
+
+class RetryableFaucetError(RuntimeError):
+    """Raised when faucet responds with a retryable status code."""
 
 
 class FaucetManager:
@@ -172,7 +178,42 @@ class FaucetManager:
                     headers["x-is-jwt"] = "true"
                     headers["Authorization"] = jwt if jwt.lower().startswith("bearer ") else f"Bearer {jwt}"
 
-                response = await client.post(self.api_url, params=params, headers=headers)
+                async def _claim_once() -> httpx.Response:
+                    response = await client.post(self.api_url, params=params, headers=headers)
+                    if response.status_code in RETRYABLE_HTTP_STATUS_CODES:
+                        raise RetryableFaucetError(f"HTTP {response.status_code}: {response.text}")
+                    return response
+
+                retry_conf = getattr(getattr(self.config, "retry", None), "faucet_http", None)
+                retry_attempts = int(getattr(retry_conf, "attempts", 3))
+                retry_base = float(getattr(retry_conf, "base_delay_seconds", 1.0))
+                retry_max = float(getattr(retry_conf, "max_delay_seconds", 16.0))
+                retry_jitter = float(getattr(retry_conf, "jitter_ratio", 0.1))
+                ok, response_obj, retry_err, retry_telemetry = await execute_with_retry(
+                    _claim_once,
+                    attempts=retry_attempts,
+                    base_delay_seconds=retry_base,
+                    max_delay_seconds=retry_max,
+                    jitter_ratio=retry_jitter,
+                    is_retryable=lambda exc: isinstance(exc, (RetryableFaucetError, httpx.HTTPError)),
+                )
+                if not ok:
+                    error_msg = str(retry_err) if retry_err else "faucet_request_failed"
+                    logger.error(
+                        "Faucet claim failed after retries={} delay={:.2f}s: {}",
+                        retry_telemetry.retries,
+                        retry_telemetry.total_delay_seconds,
+                        error_msg,
+                    )
+                    self.db.insert_faucet_claim(
+                        network=self.config.network,
+                        amount=self.amount_octas,
+                        status="failed",
+                        error_message=error_msg,
+                        retry_count=retry_telemetry.retries,
+                    )
+                    return False
+                response = response_obj
 
                 if response.status_code == 200:
                     data = response.json()
@@ -194,7 +235,8 @@ class FaucetManager:
                         network=self.config.network,
                         amount=self.amount_octas,
                         status="success",
-                        tx_hash=tx_hash
+                        tx_hash=tx_hash,
+                        retry_count=retry_telemetry.retries,
                     )
 
                     logger.info(f"Faucet claim successful: {self.format_amount()} | TX: {tx_hash}")
@@ -207,7 +249,8 @@ class FaucetManager:
                         network=self.config.network,
                         amount=self.amount_octas,
                         status="failed",
-                        error_message=error_msg
+                        error_message=error_msg,
+                        retry_count=retry_telemetry.retries,
                     )
                     return False
 
@@ -217,7 +260,8 @@ class FaucetManager:
                 network=self.config.network,
                 amount=self.amount_octas,
                 status="error",
-                error_message=str(e)
+                error_message=str(e),
+                retry_count=0,
             )
             return False
 

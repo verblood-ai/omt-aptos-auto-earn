@@ -9,6 +9,7 @@ if str(PROJECT_DIR) not in sys.path:
 
 from src.config import Config, PROJECT_ROOT
 from src.main import AptosAutoEarn
+from src.strategy_engine import StrategyDecision
 
 
 class TestMainRuntime(unittest.IsolatedAsyncioTestCase):
@@ -93,6 +94,48 @@ class TestMainRuntime(unittest.IsolatedAsyncioTestCase):
         orchestrator.run_activity_cycle.assert_awaited_once()
         self.assertEqual(orchestrator._scheduled_job_queue.qsize(), 0)
         self.assertEqual(len(orchestrator._scheduled_jobs_enqueued), 0)
+
+    async def test_readiness_gate_blocks_module_and_records_skip(self):
+        orchestrator = self._build_orchestrator(min_interval_minutes=0)
+        orchestrator.config.readiness.min_balance_apt = 5.0
+        orchestrator.wallet.get_balance = AsyncMock(return_value=0.1)
+        module = MagicMock()
+        module.module_name = "lending"
+        module.can_run.return_value = (True, "OK")
+        module.run = AsyncMock(return_value={"success": True, "actions": 1, "duration": 0.1})
+        orchestrator.activity_modules = [module]
+
+        await orchestrator.run_activity_cycle()
+
+        module.run.assert_not_awaited()
+        orchestrator.db.insert_activity_run.assert_called()
+        kwargs = orchestrator.db.insert_activity_run.call_args.kwargs
+        self.assertTrue(kwargs["skipped"])
+        self.assertEqual(kwargs["skip_reason"], "readiness_blocked")
+
+    async def test_strategy_enforcement_can_block_execution(self):
+        orchestrator = self._build_orchestrator(min_interval_minutes=0)
+        orchestrator.config.strategy.enabled = True
+        orchestrator.config.strategy.mode = "enforcement"
+        orchestrator.strategy_engine.evaluate = MagicMock(
+            return_value=StrategyDecision(
+                mode="enforcement",
+                effective_mode="enforcement",
+                action="block",
+                reason="enforcement_block:test",
+                severity="critical",
+            )
+        )
+        module = MagicMock()
+        module.module_name = "lending"
+        module.can_run.return_value = (True, "OK")
+        module.run = AsyncMock(return_value={"success": True, "actions": 1, "duration": 0.1})
+        orchestrator.activity_modules = [module]
+
+        await orchestrator.run_activity_cycle()
+
+        module.run.assert_not_awaited()
+        self.assertGreaterEqual(orchestrator.db.insert_strategy_decision.call_count, 1)
 
 
 if __name__ == "__main__":

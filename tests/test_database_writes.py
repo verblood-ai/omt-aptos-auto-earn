@@ -73,6 +73,38 @@ class TestDatabaseWrites(unittest.TestCase):
             finally:
                 db.close()
 
+    def test_insert_readiness_and_strategy_decisions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "metrics.duckdb"
+            db = MetricsDB(str(db_path))
+            try:
+                db.insert_readiness_event(
+                    module_name="dex_swap",
+                    status="blocked",
+                    reason="readiness_dex_preflight:missing",
+                    source="test",
+                    metadata={"signals": {"dex_preflight": {"ok": False}}},
+                )
+                db.insert_strategy_decision(
+                    correlation_id="cid-1",
+                    module_name="dex_swap",
+                    mode="shadow",
+                    effective_mode="shadow",
+                    action="allow",
+                    severity="warn",
+                    reason="shadow_hypothesis:skip_budget",
+                    stage="pre",
+                    outcome="pending",
+                    rule_hits=[{"metric": "skipped_runs", "ratio": 0.9}],
+                    inputs={"balance_apt": 1.0},
+                    metadata={"note": "test"},
+                )
+                counts = db.row_counts()
+                self.assertEqual(counts["readiness_events"], 1)
+                self.assertEqual(counts["strategy_decisions"], 1)
+            finally:
+                db.close()
+
 
 if __name__ == "__main__":
     unittest.main()

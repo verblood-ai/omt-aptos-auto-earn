@@ -2,7 +2,7 @@
 
 import os
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 import yaml
 from dotenv import load_dotenv
@@ -101,6 +101,263 @@ class ContractsConfig(BaseModel):
     nft_marketplace: str = ""
 
 
+class RetryPolicyConfig(BaseModel):
+    attempts: int = 3
+    base_delay_seconds: float = 1.0
+    max_delay_seconds: float = 8.0
+    jitter_ratio: float = 0.1
+
+    @field_validator("attempts")
+    @classmethod
+    def validate_attempts(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("retry attempts must be >= 1")
+        return v
+
+    @field_validator("base_delay_seconds", "max_delay_seconds")
+    @classmethod
+    def validate_delays(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("retry delays must be >= 0")
+        return v
+
+    @field_validator("jitter_ratio")
+    @classmethod
+    def validate_jitter(cls, v: float) -> float:
+        if v < 0 or v > 1:
+            raise ValueError("retry jitter_ratio must be in [0, 1]")
+        return v
+
+
+class RetryConfig(BaseModel):
+    rpc: RetryPolicyConfig = Field(default_factory=RetryPolicyConfig)
+    faucet_http: RetryPolicyConfig = Field(
+        default_factory=lambda: RetryPolicyConfig(attempts=3, base_delay_seconds=1.0, max_delay_seconds=16.0, jitter_ratio=0.1)
+    )
+    scraping: RetryPolicyConfig = Field(
+        default_factory=lambda: RetryPolicyConfig(attempts=3, base_delay_seconds=1.0, max_delay_seconds=16.0, jitter_ratio=0.1)
+    )
+
+
+class ReadinessConfig(BaseModel):
+    enabled: bool = True
+    fail_mode: str = "closed"  # closed | open
+    signal_ttl_seconds: int = 900
+    mandatory_checks: list[str] = Field(
+        default_factory=lambda: ["rpc_health", "min_balance_guard", "dex_preflight"]
+    )
+    min_balance_apt: float = 0.0
+    require_dex_preflight: bool = True
+    require_faucet_eligibility: bool = False
+    dedup_log_window_seconds: int = 300
+
+    @field_validator("fail_mode")
+    @classmethod
+    def validate_fail_mode(cls, v: str) -> str:
+        val = (v or "").strip().lower()
+        if val not in {"open", "closed"}:
+            raise ValueError("readiness.fail_mode must be 'open' or 'closed'")
+        return val
+
+    @field_validator("signal_ttl_seconds")
+    @classmethod
+    def validate_signal_ttl(cls, v: int) -> int:
+        if v < 30:
+            raise ValueError("readiness.signal_ttl_seconds must be >= 30")
+        return v
+
+    @field_validator("min_balance_apt")
+    @classmethod
+    def validate_min_balance_apt(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("readiness.min_balance_apt must be >= 0")
+        return v
+
+    @field_validator("dedup_log_window_seconds")
+    @classmethod
+    def validate_dedup_window(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("readiness.dedup_log_window_seconds must be >= 0")
+        return v
+
+    @field_validator("mandatory_checks")
+    @classmethod
+    def validate_mandatory_checks(cls, values: list[str]) -> list[str]:
+        allowed = {"rpc_health", "dex_preflight", "min_balance_guard", "faucet_eligibility_freshness"}
+        cleaned: list[str] = []
+        for raw in values:
+            item = (raw or "").strip().lower()
+            if not item:
+                continue
+            if item not in allowed:
+                raise ValueError(f"Unsupported readiness check: {item}")
+            if item not in cleaned:
+                cleaned.append(item)
+        return cleaned
+
+
+class KPIAlertsConfig(BaseModel):
+    enabled: bool = False
+    window_hours: int = 24
+    evaluation_interval_minutes: int = 30
+    cooldown_minutes: int = 120
+    enabled_kpis: list[str] = Field(
+        default_factory=lambda: [
+            "skip_rate",
+            "success_rate",
+            "retry_burst",
+            "faucet_claim_gap",
+            "airdrop_check_staleness",
+        ]
+    )
+    skip_rate_warn: float = 0.30
+    skip_rate_critical: float = 0.50
+    success_rate_warn: float = 0.80
+    success_rate_critical: float = 0.60
+    retry_burst_warn: int = 4
+    retry_burst_critical: int = 8
+    faucet_claim_gap_warn_hours: int = 30
+    faucet_claim_gap_critical_hours: int = 48
+    airdrop_check_staleness_warn_hours: int = 12
+    airdrop_check_staleness_critical_hours: int = 24
+
+    @field_validator("window_hours", "evaluation_interval_minutes", "cooldown_minutes")
+    @classmethod
+    def validate_positive_window_values(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("kpi_alerts window/interval/cooldown values must be >= 1")
+        return v
+
+    @field_validator("retry_burst_warn", "retry_burst_critical")
+    @classmethod
+    def validate_retry_thresholds(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("kpi_alerts retry thresholds must be >= 0")
+        return v
+
+    @field_validator(
+        "faucet_claim_gap_warn_hours",
+        "faucet_claim_gap_critical_hours",
+        "airdrop_check_staleness_warn_hours",
+        "airdrop_check_staleness_critical_hours",
+    )
+    @classmethod
+    def validate_hour_thresholds(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("kpi_alerts hour thresholds must be >= 1")
+        return v
+
+    @field_validator("skip_rate_warn", "skip_rate_critical", "success_rate_warn", "success_rate_critical")
+    @classmethod
+    def validate_ratio_thresholds(cls, v: float) -> float:
+        if v < 0 or v > 1:
+            raise ValueError("kpi_alerts ratio thresholds must be in [0, 1]")
+        return v
+
+    @field_validator("enabled_kpis")
+    @classmethod
+    def validate_enabled_kpis(cls, values: list[str]) -> list[str]:
+        allowed = {"skip_rate", "success_rate", "retry_burst", "faucet_claim_gap", "airdrop_check_staleness"}
+        out: list[str] = []
+        for raw in values:
+            item = (raw or "").strip().lower()
+            if not item:
+                continue
+            if item not in allowed:
+                raise ValueError(f"Unsupported KPI key: {item}")
+            if item not in out:
+                out.append(item)
+        return out
+
+
+class PolicyBudgetOverrideConfig(BaseModel):
+    skip_budget: Optional[int] = None
+    retry_budget: Optional[int] = None
+    failed_runs_budget: Optional[int] = None
+    execution_budget: Optional[int] = None
+
+    @field_validator("skip_budget", "retry_budget", "failed_runs_budget", "execution_budget")
+    @classmethod
+    def validate_optional_budget(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v < 0:
+            raise ValueError("policy budgets must be >= 0")
+        return v
+
+
+class PolicyConfig(BaseModel):
+    enabled: bool = True
+    window_hours: int = 24
+    skip_budget: int = 12
+    retry_budget: int = 8
+    failed_runs_budget: int = 6
+    execution_budget: int = 200
+    advisory_ratio: float = 0.85
+    warning_ratios: list[float] = Field(default_factory=lambda: [0.7, 0.85, 0.95])
+    module_overrides: Dict[str, PolicyBudgetOverrideConfig] = Field(default_factory=dict)
+
+    @field_validator("window_hours")
+    @classmethod
+    def validate_window_hours(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("strategy.policy.window_hours must be >= 1")
+        return v
+
+    @field_validator("skip_budget", "retry_budget", "failed_runs_budget", "execution_budget")
+    @classmethod
+    def validate_budget_values(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("strategy policy budgets must be >= 0")
+        return v
+
+    @field_validator("advisory_ratio")
+    @classmethod
+    def validate_advisory_ratio(cls, v: float) -> float:
+        if v < 0 or v > 1:
+            raise ValueError("strategy.policy.advisory_ratio must be in [0, 1]")
+        return v
+
+    @field_validator("warning_ratios")
+    @classmethod
+    def validate_warning_ratios(cls, values: list[float]) -> list[float]:
+        out: list[float] = []
+        for value in values:
+            if value < 0 or value > 1:
+                raise ValueError("strategy.policy.warning_ratios values must be in [0, 1]")
+            out.append(float(value))
+        return out
+
+
+class StrategyConfig(BaseModel):
+    enabled: bool = False
+    mode: str = "shadow"  # shadow | advisory | enforcement
+    force_mode: str = ""  # "", shadow, advisory
+    advisory_cooldown_minutes: int = 60
+    policy: PolicyConfig = Field(default_factory=PolicyConfig)
+
+    @field_validator("mode")
+    @classmethod
+    def validate_mode(cls, v: str) -> str:
+        val = (v or "").strip().lower()
+        if val not in {"shadow", "advisory", "enforcement"}:
+            raise ValueError("strategy.mode must be shadow, advisory or enforcement")
+        return val
+
+    @field_validator("force_mode")
+    @classmethod
+    def validate_force_mode(cls, v: str) -> str:
+        val = (v or "").strip().lower()
+        if val not in {"", "shadow", "advisory"}:
+            raise ValueError("strategy.force_mode must be empty, shadow or advisory")
+        return val
+
+    @field_validator("advisory_cooldown_minutes")
+    @classmethod
+    def validate_advisory_cooldown(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("strategy.advisory_cooldown_minutes must be >= 1")
+        return v
+
+
 class Config(BaseModel):
     network: str = "testnet"
     node_url: str = "https://fullnode.testnet.aptoslabs.com/v1"
@@ -112,6 +369,10 @@ class Config(BaseModel):
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     contracts: ContractsConfig = Field(default_factory=ContractsConfig)
+    readiness: ReadinessConfig = Field(default_factory=ReadinessConfig)
+    retry: RetryConfig = Field(default_factory=RetryConfig)
+    kpi_alerts: KPIAlertsConfig = Field(default_factory=KPIAlertsConfig)
+    strategy: StrategyConfig = Field(default_factory=StrategyConfig)
 
     @property
     def env(self) -> Dict[str, str]:
@@ -258,6 +519,192 @@ class Config(BaseModel):
         if _ltc is not None and str(_ltc).strip():
             contracts_data["liquidswap_test_coins"] = str(_ltc).strip()
         config_data["contracts"] = contracts_data
+
+        # Readiness gate overrides
+        readiness_data = dict(config_data.get("readiness") or {})
+        readiness_data["enabled"] = os.getenv(
+            "READINESS_ENABLED",
+            str(readiness_data.get("enabled", True)),
+        ).lower() == "true"
+        readiness_data["fail_mode"] = os.getenv("READINESS_FAIL_MODE", readiness_data.get("fail_mode", "closed"))
+        readiness_data["signal_ttl_seconds"] = int(
+            os.getenv("READINESS_SIGNAL_TTL_SECONDS", readiness_data.get("signal_ttl_seconds", 900))
+        )
+        readiness_data["min_balance_apt"] = float(
+            os.getenv("READINESS_MIN_BALANCE_APT", readiness_data.get("min_balance_apt", 0.0))
+        )
+        readiness_data["require_dex_preflight"] = os.getenv(
+            "READINESS_REQUIRE_DEX_PREFLIGHT",
+            str(readiness_data.get("require_dex_preflight", True)),
+        ).lower() == "true"
+        readiness_data["require_faucet_eligibility"] = os.getenv(
+            "READINESS_REQUIRE_FAUCET_ELIGIBILITY",
+            str(readiness_data.get("require_faucet_eligibility", False)),
+        ).lower() == "true"
+        readiness_data["dedup_log_window_seconds"] = int(
+            os.getenv(
+                "READINESS_DEDUP_LOG_WINDOW_SECONDS",
+                readiness_data.get("dedup_log_window_seconds", 300),
+            )
+        )
+        mandatory_checks_env = os.getenv("READINESS_MANDATORY_CHECKS")
+        if mandatory_checks_env is not None and mandatory_checks_env.strip():
+            readiness_data["mandatory_checks"] = [
+                item.strip() for item in mandatory_checks_env.split(",") if item.strip()
+            ]
+        config_data["readiness"] = readiness_data
+
+        # Retry policy overrides (RPC/Faucet/Scraping)
+        retry_data = dict(config_data.get("retry") or {})
+        rpc_retry_data = dict(retry_data.get("rpc") or {})
+        rpc_retry_data["attempts"] = int(os.getenv("RETRY_RPC_ATTEMPTS", rpc_retry_data.get("attempts", 3)))
+        rpc_retry_data["base_delay_seconds"] = float(
+            os.getenv("RETRY_RPC_BASE_DELAY_SECONDS", rpc_retry_data.get("base_delay_seconds", 1.0))
+        )
+        rpc_retry_data["max_delay_seconds"] = float(
+            os.getenv("RETRY_RPC_MAX_DELAY_SECONDS", rpc_retry_data.get("max_delay_seconds", 8.0))
+        )
+        rpc_retry_data["jitter_ratio"] = float(
+            os.getenv("RETRY_RPC_JITTER_RATIO", rpc_retry_data.get("jitter_ratio", 0.1))
+        )
+        retry_data["rpc"] = rpc_retry_data
+
+        faucet_retry_data = dict(retry_data.get("faucet_http") or {})
+        faucet_retry_data["attempts"] = int(
+            os.getenv("RETRY_FAUCET_ATTEMPTS", faucet_retry_data.get("attempts", 3))
+        )
+        faucet_retry_data["base_delay_seconds"] = float(
+            os.getenv(
+                "RETRY_FAUCET_BASE_DELAY_SECONDS",
+                faucet_retry_data.get("base_delay_seconds", 1.0),
+            )
+        )
+        faucet_retry_data["max_delay_seconds"] = float(
+            os.getenv(
+                "RETRY_FAUCET_MAX_DELAY_SECONDS",
+                faucet_retry_data.get("max_delay_seconds", 16.0),
+            )
+        )
+        faucet_retry_data["jitter_ratio"] = float(
+            os.getenv("RETRY_FAUCET_JITTER_RATIO", faucet_retry_data.get("jitter_ratio", 0.1))
+        )
+        retry_data["faucet_http"] = faucet_retry_data
+
+        scraping_retry_data = dict(retry_data.get("scraping") or {})
+        scraping_retry_data["attempts"] = int(
+            os.getenv("RETRY_SCRAPING_ATTEMPTS", scraping_retry_data.get("attempts", 3))
+        )
+        scraping_retry_data["base_delay_seconds"] = float(
+            os.getenv(
+                "RETRY_SCRAPING_BASE_DELAY_SECONDS",
+                scraping_retry_data.get("base_delay_seconds", 1.0),
+            )
+        )
+        scraping_retry_data["max_delay_seconds"] = float(
+            os.getenv(
+                "RETRY_SCRAPING_MAX_DELAY_SECONDS",
+                scraping_retry_data.get("max_delay_seconds", 16.0),
+            )
+        )
+        scraping_retry_data["jitter_ratio"] = float(
+            os.getenv("RETRY_SCRAPING_JITTER_RATIO", scraping_retry_data.get("jitter_ratio", 0.1))
+        )
+        retry_data["scraping"] = scraping_retry_data
+        config_data["retry"] = retry_data
+
+        # KPI alerts overrides
+        kpi_data = dict(config_data.get("kpi_alerts") or {})
+        kpi_data["enabled"] = os.getenv("KPI_ALERTS_ENABLED", str(kpi_data.get("enabled", False))).lower() == "true"
+        kpi_data["window_hours"] = int(os.getenv("KPI_ALERTS_WINDOW_HOURS", kpi_data.get("window_hours", 24)))
+        kpi_data["evaluation_interval_minutes"] = int(
+            os.getenv("KPI_ALERTS_EVAL_INTERVAL_MINUTES", kpi_data.get("evaluation_interval_minutes", 30))
+        )
+        kpi_data["cooldown_minutes"] = int(
+            os.getenv("KPI_ALERTS_COOLDOWN_MINUTES", kpi_data.get("cooldown_minutes", 120))
+        )
+        enabled_kpis_env = os.getenv("KPI_ALERTS_ENABLED_KPIS")
+        if enabled_kpis_env is not None and enabled_kpis_env.strip():
+            kpi_data["enabled_kpis"] = [item.strip() for item in enabled_kpis_env.split(",") if item.strip()]
+        kpi_data["skip_rate_warn"] = float(os.getenv("KPI_SKIP_RATE_WARN", kpi_data.get("skip_rate_warn", 0.30)))
+        kpi_data["skip_rate_critical"] = float(
+            os.getenv("KPI_SKIP_RATE_CRITICAL", kpi_data.get("skip_rate_critical", 0.50))
+        )
+        kpi_data["success_rate_warn"] = float(
+            os.getenv("KPI_SUCCESS_RATE_WARN", kpi_data.get("success_rate_warn", 0.80))
+        )
+        kpi_data["success_rate_critical"] = float(
+            os.getenv("KPI_SUCCESS_RATE_CRITICAL", kpi_data.get("success_rate_critical", 0.60))
+        )
+        kpi_data["retry_burst_warn"] = int(
+            os.getenv("KPI_RETRY_BURST_WARN", kpi_data.get("retry_burst_warn", 4))
+        )
+        kpi_data["retry_burst_critical"] = int(
+            os.getenv("KPI_RETRY_BURST_CRITICAL", kpi_data.get("retry_burst_critical", 8))
+        )
+        kpi_data["faucet_claim_gap_warn_hours"] = int(
+            os.getenv(
+                "KPI_FAUCET_CLAIM_GAP_WARN_HOURS",
+                kpi_data.get("faucet_claim_gap_warn_hours", 30),
+            )
+        )
+        kpi_data["faucet_claim_gap_critical_hours"] = int(
+            os.getenv(
+                "KPI_FAUCET_CLAIM_GAP_CRITICAL_HOURS",
+                kpi_data.get("faucet_claim_gap_critical_hours", 48),
+            )
+        )
+        kpi_data["airdrop_check_staleness_warn_hours"] = int(
+            os.getenv(
+                "KPI_AIRDROP_STALENESS_WARN_HOURS",
+                kpi_data.get("airdrop_check_staleness_warn_hours", 12),
+            )
+        )
+        kpi_data["airdrop_check_staleness_critical_hours"] = int(
+            os.getenv(
+                "KPI_AIRDROP_STALENESS_CRITICAL_HOURS",
+                kpi_data.get("airdrop_check_staleness_critical_hours", 24),
+            )
+        )
+        config_data["kpi_alerts"] = kpi_data
+
+        # Strategy / policy overrides
+        strategy_data = dict(config_data.get("strategy") or {})
+        strategy_data["enabled"] = os.getenv(
+            "STRATEGY_ENABLED",
+            str(strategy_data.get("enabled", False)),
+        ).lower() == "true"
+        strategy_data["mode"] = os.getenv("STRATEGY_MODE", strategy_data.get("mode", "shadow"))
+        strategy_data["force_mode"] = os.getenv("STRATEGY_FORCE_MODE", strategy_data.get("force_mode", ""))
+        strategy_data["advisory_cooldown_minutes"] = int(
+            os.getenv(
+                "STRATEGY_ADVISORY_COOLDOWN_MINUTES",
+                strategy_data.get("advisory_cooldown_minutes", 60),
+            )
+        )
+        policy_data = dict(strategy_data.get("policy") or {})
+        policy_data["enabled"] = os.getenv(
+            "POLICY_ENABLED",
+            str(policy_data.get("enabled", True)),
+        ).lower() == "true"
+        policy_data["window_hours"] = int(os.getenv("POLICY_WINDOW_HOURS", policy_data.get("window_hours", 24)))
+        policy_data["skip_budget"] = int(os.getenv("POLICY_SKIP_BUDGET", policy_data.get("skip_budget", 12)))
+        policy_data["retry_budget"] = int(os.getenv("POLICY_RETRY_BUDGET", policy_data.get("retry_budget", 8)))
+        policy_data["failed_runs_budget"] = int(
+            os.getenv("POLICY_FAILED_RUNS_BUDGET", policy_data.get("failed_runs_budget", 6))
+        )
+        policy_data["execution_budget"] = int(
+            os.getenv("POLICY_EXECUTION_BUDGET", policy_data.get("execution_budget", 200))
+        )
+        policy_data["advisory_ratio"] = float(
+            os.getenv("POLICY_ADVISORY_RATIO", policy_data.get("advisory_ratio", 0.85))
+        )
+        warning_ratios_env = os.getenv("POLICY_WARNING_RATIOS")
+        if warning_ratios_env is not None and warning_ratios_env.strip():
+            policy_data["warning_ratios"] = [
+                float(item.strip()) for item in warning_ratios_env.split(",") if item.strip()
+            ]
+        strategy_data["policy"] = policy_data
+        config_data["strategy"] = strategy_data
 
         # Fill required defaults that may be missing from YAML (older configs)
         network = config_data.get("network", "testnet")

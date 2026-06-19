@@ -70,3 +70,75 @@ contracts:
   
   # NFT marketplaces (testnet/devnet)
   nft_marketplace: "0x4c5e8a45b9a86b4c1a77c5e9a4a4b2e8a45b9a86b4c1a77c5e9a4a4b2e8a45b9a"  # placeholder
+
+# Readiness gate before activity execution
+readiness:
+  enabled: true
+  fail_mode: "closed"  # closed | open
+  signal_ttl_seconds: 900
+  mandatory_checks:
+    - "rpc_health"
+    - "min_balance_guard"
+    - "dex_preflight"
+  min_balance_apt: 0.0
+  require_dex_preflight: true
+  require_faucet_eligibility: false
+  dedup_log_window_seconds: 300
+
+# Unified retry/backoff policies
+retry:
+  rpc:
+    attempts: 3
+    base_delay_seconds: 1.0
+    max_delay_seconds: 8.0
+    jitter_ratio: 0.1
+  faucet_http:
+    attempts: 3
+    base_delay_seconds: 1.0
+    max_delay_seconds: 16.0
+    jitter_ratio: 0.1
+  scraping:
+    attempts: 3
+    base_delay_seconds: 1.0
+    max_delay_seconds: 16.0
+    jitter_ratio: 0.1
+
+# KPI evaluation and alerts
+kpi_alerts:
+  enabled: false
+  window_hours: 24
+  evaluation_interval_minutes: 30
+  cooldown_minutes: 120
+  enabled_kpis:
+    - "skip_rate"
+    - "success_rate"
+    - "retry_burst"
+    - "faucet_claim_gap"
+    - "airdrop_check_staleness"
+  skip_rate_warn: 0.30
+  skip_rate_critical: 0.50
+  success_rate_warn: 0.80
+  success_rate_critical: 0.60
+  retry_burst_warn: 4
+  retry_burst_critical: 8
+  faucet_claim_gap_warn_hours: 30
+  faucet_claim_gap_critical_hours: 48
+  airdrop_check_staleness_warn_hours: 12
+  airdrop_check_staleness_critical_hours: 24
+
+# Strategy/policy engine (Iter.2)
+strategy:
+  enabled: false
+  mode: "shadow"   # shadow | advisory | enforcement
+  force_mode: ""   # "", shadow, advisory
+  advisory_cooldown_minutes: 60
+  policy:
+    enabled: true
+    window_hours: 24
+    skip_budget: 12
+    retry_budget: 8
+    failed_runs_budget: 6
+    execution_budget: 200
+    advisory_ratio: 0.85
+    warning_ratios: [0.70, 0.85, 0.95]
+    module_overrides: {}

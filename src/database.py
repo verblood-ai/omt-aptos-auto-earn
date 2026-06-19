@@ -19,6 +19,8 @@ METRICS_TABLES: tuple[str, ...] = (
     "airdrops_found",
     "activity_runs",
     "dex_swaps",
+    "readiness_events",
+    "strategy_decisions",
 )
 
 
@@ -46,6 +48,8 @@ class MetricsDB:
         self.conn.execute("CREATE SEQUENCE IF NOT EXISTS faucet_claims_seq START 1")
         self.conn.execute("CREATE SEQUENCE IF NOT EXISTS airdrops_found_seq START 1")
         self.conn.execute("CREATE SEQUENCE IF NOT EXISTS activity_runs_seq START 1")
+        self.conn.execute("CREATE SEQUENCE IF NOT EXISTS readiness_events_seq START 1")
+        self.conn.execute("CREATE SEQUENCE IF NOT EXISTS strategy_decisions_seq START 1")
 
         # Balance history
         self.conn.execute("""
@@ -82,7 +86,8 @@ class MetricsDB:
                 amount DOUBLE,
                 status VARCHAR,
                 tx_hash VARCHAR,
-                error_message VARCHAR
+                error_message VARCHAR,
+                retry_count INTEGER DEFAULT 0
             )
         """)
 
@@ -108,7 +113,13 @@ class MetricsDB:
                 duration_seconds DOUBLE,
                 actions_performed INTEGER,
                 success BOOLEAN,
-                error_message VARCHAR
+                error_message VARCHAR,
+                skipped BOOLEAN DEFAULT FALSE,
+                skip_reason VARCHAR,
+                error_class VARCHAR,
+                gate_reason VARCHAR,
+                retry_count INTEGER DEFAULT 0,
+                metadata JSON
             )
         """)
 
@@ -124,6 +135,54 @@ class MetricsDB:
                 success BOOLEAN
             )
         """)
+
+        # Readiness gate events
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS readiness_events (
+                event_id BIGINT PRIMARY KEY DEFAULT nextval('readiness_events_seq'),
+                timestamp TIMESTAMP,
+                module_name VARCHAR,
+                status VARCHAR,
+                reason VARCHAR,
+                source VARCHAR,
+                metadata JSON
+            )
+        """)
+
+        # Strategy / policy decisions
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS strategy_decisions (
+                decision_id BIGINT PRIMARY KEY DEFAULT nextval('strategy_decisions_seq'),
+                timestamp TIMESTAMP,
+                correlation_id VARCHAR,
+                module_name VARCHAR,
+                mode VARCHAR,
+                effective_mode VARCHAR,
+                action VARCHAR,
+                severity VARCHAR,
+                reason VARCHAR,
+                stage VARCHAR,
+                outcome VARCHAR,
+                rule_hits JSON,
+                inputs JSON,
+                metadata JSON
+            )
+        """)
+
+        self._migrate_schema()
+
+    def _migrate_schema(self) -> None:
+        """Best-effort ALTER TABLE migration for legacy DB files."""
+        self._ensure_column("faucet_claims", "retry_count", "INTEGER DEFAULT 0")
+        self._ensure_column("activity_runs", "skipped", "BOOLEAN DEFAULT FALSE")
+        self._ensure_column("activity_runs", "skip_reason", "VARCHAR")
+        self._ensure_column("activity_runs", "error_class", "VARCHAR")
+        self._ensure_column("activity_runs", "gate_reason", "VARCHAR")
+        self._ensure_column("activity_runs", "retry_count", "INTEGER DEFAULT 0")
+        self._ensure_column("activity_runs", "metadata", "JSON")
+
+    def _ensure_column(self, table_name: str, column_name: str, column_sql: str) -> None:
+        self.conn.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS {column_name} {column_sql}")
 
     def insert_balance(self, network: str, token_symbol: str, balance: float, usd_value: Optional[float] = None):
         """Insert a balance snapshot."""
@@ -160,14 +219,15 @@ class MetricsDB:
         amount: float,
         status: str,
         tx_hash: Optional[str] = None,
-        error_message: Optional[str] = None
+        error_message: Optional[str] = None,
+        retry_count: int = 0,
     ):
         """Insert a faucet claim record."""
         self.conn.execute("""
             INSERT INTO faucet_claims
-            (timestamp, network, amount, status, tx_hash, error_message)
-            VALUES (CURRENT_TIMESTAMP, ?, ?, ?, ?, ?)
-        """, [network, amount, status, tx_hash, error_message])
+            (timestamp, network, amount, status, tx_hash, error_message, retry_count)
+            VALUES (CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?)
+        """, [network, amount, status, tx_hash, error_message, int(retry_count)])
 
     def insert_airdrop(
         self,
@@ -190,14 +250,132 @@ class MetricsDB:
         duration_seconds: float,
         actions_performed: int,
         success: bool,
-        error_message: Optional[str] = None
+        error_message: Optional[str] = None,
+        skipped: bool = False,
+        skip_reason: Optional[str] = None,
+        error_class: Optional[str] = None,
+        gate_reason: Optional[str] = None,
+        retry_count: int = 0,
+        metadata: Optional[Dict[str, Any]] = None,
     ):
         """Insert an activity run record."""
         self.conn.execute("""
             INSERT INTO activity_runs
-            (timestamp, module_name, duration_seconds, actions_performed, success, error_message)
+            (
+                timestamp,
+                module_name,
+                duration_seconds,
+                actions_performed,
+                success,
+                error_message,
+                skipped,
+                skip_reason,
+                error_class,
+                gate_reason,
+                retry_count,
+                metadata
+            )
+            VALUES (CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, [
+            module_name,
+            duration_seconds,
+            actions_performed,
+            success,
+            error_message,
+            bool(skipped),
+            skip_reason,
+            error_class,
+            gate_reason,
+            int(retry_count),
+            json.dumps(metadata) if metadata is not None else None,
+        ])
+
+    def insert_readiness_event(
+        self,
+        module_name: str,
+        status: str,
+        reason: str,
+        source: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO readiness_events
+            (timestamp, module_name, status, reason, source, metadata)
             VALUES (CURRENT_TIMESTAMP, ?, ?, ?, ?, ?)
-        """, [module_name, duration_seconds, actions_performed, success, error_message])
+            """,
+            [
+                module_name,
+                status,
+                reason,
+                source,
+                json.dumps(metadata) if metadata is not None else None,
+            ],
+        )
+
+    def insert_strategy_decision(
+        self,
+        correlation_id: str,
+        module_name: str,
+        mode: str,
+        effective_mode: str,
+        action: str,
+        severity: str,
+        reason: str,
+        stage: str,
+        outcome: str,
+        rule_hits: Optional[List[Dict[str, Any]]] = None,
+        inputs: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO strategy_decisions
+            (
+                timestamp,
+                correlation_id,
+                module_name,
+                mode,
+                effective_mode,
+                action,
+                severity,
+                reason,
+                stage,
+                outcome,
+                rule_hits,
+                inputs,
+                metadata
+            )
+            VALUES (CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                correlation_id,
+                module_name,
+                mode,
+                effective_mode,
+                action,
+                severity,
+                reason,
+                stage,
+                outcome,
+                json.dumps(rule_hits) if rule_hits is not None else None,
+                json.dumps(inputs) if inputs is not None else None,
+                json.dumps(metadata) if metadata is not None else None,
+            ],
+        )
+
+    def get_last_faucet_success_ts(self) -> Optional[str]:
+        row = self.conn.execute(
+            """
+            SELECT MAX(timestamp) FROM faucet_claims WHERE status = 'success'
+            """
+        ).fetchone()
+        if not row or row[0] is None:
+            return None
+        value = row[0]
+        if isinstance(value, datetime.datetime):
+            return value.isoformat()
+        return str(value)
 
     def record_swap(
         self,

@@ -82,6 +82,50 @@ class TestConfig(unittest.TestCase):
             else:
                 os.environ["SCHEDULER_AIRDROP_INTERVAL_HOURS"] = prev_sch
 
+    def test_readiness_and_strategy_env_overrides(self):
+        prev_mode = os.environ.get("STRATEGY_MODE")
+        prev_enabled = os.environ.get("STRATEGY_ENABLED")
+        prev_checks = os.environ.get("READINESS_MANDATORY_CHECKS")
+        os.environ["STRATEGY_ENABLED"] = "true"
+        os.environ["STRATEGY_MODE"] = "advisory"
+        os.environ["READINESS_MANDATORY_CHECKS"] = "rpc_health,min_balance_guard"
+        try:
+            cfg = Config.load(
+                config_path=str(PROJECT_ROOT / "config" / "config.yaml"),
+                env_path=str(PROJECT_ROOT / ".env.does-not-exist"),
+            )
+            self.assertTrue(cfg.strategy.enabled)
+            self.assertEqual(cfg.strategy.mode, "advisory")
+            self.assertEqual(cfg.readiness.mandatory_checks, ["rpc_health", "min_balance_guard"])
+        finally:
+            if prev_mode is None:
+                os.environ.pop("STRATEGY_MODE", None)
+            else:
+                os.environ["STRATEGY_MODE"] = prev_mode
+            if prev_enabled is None:
+                os.environ.pop("STRATEGY_ENABLED", None)
+            else:
+                os.environ["STRATEGY_ENABLED"] = prev_enabled
+            if prev_checks is None:
+                os.environ.pop("READINESS_MANDATORY_CHECKS", None)
+            else:
+                os.environ["READINESS_MANDATORY_CHECKS"] = prev_checks
+
+    def test_invalid_readiness_mode_raises(self):
+        prev = os.environ.get("READINESS_FAIL_MODE")
+        os.environ["READINESS_FAIL_MODE"] = "invalid"
+        try:
+            with self.assertRaises(ValueError):
+                Config.load(
+                    config_path=str(PROJECT_ROOT / "config" / "config.yaml"),
+                    env_path=str(PROJECT_ROOT / ".env.does-not-exist"),
+                )
+        finally:
+            if prev is None:
+                os.environ.pop("READINESS_FAIL_MODE", None)
+            else:
+                os.environ["READINESS_FAIL_MODE"] = prev
+
 
 if __name__ == "__main__":
     unittest.main()
